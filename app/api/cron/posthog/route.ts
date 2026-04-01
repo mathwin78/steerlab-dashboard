@@ -2,18 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
 import { initDB } from "@/lib/db/init";
 
-interface PostHogDataPoint {
-  days: string[];
-  data: number[];
-  label: string;
-}
-
-interface PostHogTrendResponse {
-  result: PostHogDataPoint[];
+interface PostHogQueryResponse {
+  results: Array<[string, number]>;
 }
 
 export async function GET(request: NextRequest) {
-  // Verify cron secret to prevent unauthorized calls
   const authHeader = request.headers.get("authorization");
   const cronSecret = process.env.CRON_SECRET;
 
@@ -34,20 +27,30 @@ export async function GET(request: NextRequest) {
   try {
     await initDB();
 
-    const params = new URLSearchParams({
-      events: JSON.stringify([{ id: "$pageview" }]),
-      date_from: "-7d",
-      interval: "day",
-    });
-
+    // Use HogQL query API (works on all PostHog plans)
     const response = await fetch(
-      `https://app.posthog.com/api/projects/${projectId}/insights/trend/?${params.toString()}`,
+      `https://eu.posthog.com/api/projects/${projectId}/query`,
       {
+        method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        // Ensure fresh data
+        body: JSON.stringify({
+          query: {
+            kind: "HogQLQuery",
+            query: `
+              SELECT
+                toDate(timestamp) AS day,
+                count() AS pageviews
+              FROM events
+              WHERE event = '$pageview'
+                AND timestamp >= now() - interval 7 day
+              GROUP BY day
+              ORDER BY day ASC
+            `,
+          },
+        }),
         cache: "no-store",
       }
     );
@@ -61,26 +64,17 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const json: PostHogTrendResponse = await response.json();
-    const result = json.result?.[0];
-
-    if (!result) {
-      return NextResponse.json(
-        { error: "No data returned from PostHog" },
-        { status: 500 }
-      );
-    }
-
-    const { days, data } = result;
+    const json: PostHogQueryResponse = await response.json();
+    const rows = json.results ?? [];
     let upsertCount = 0;
 
-    for (let i = 0; i < days.length; i++) {
-      const date = days[i].split("T")[0]; // normalize to YYYY-MM-DD
-      const count = Math.round(data[i] ?? 0);
+    for (const [day, count] of rows) {
+      const date = day.split("T")[0];
+      const views = Math.round(count ?? 0);
 
       await sql`
         INSERT INTO pageviews (date, count, updated_at)
-        VALUES (${date}, ${count}, NOW())
+        VALUES (${date}, ${views}, NOW())
         ON CONFLICT (date)
         DO UPDATE SET count = EXCLUDED.count, updated_at = NOW()
       `;
